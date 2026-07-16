@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,12 +22,14 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStatusBar,
     QVBoxLayout,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
 from config import (
     AMPLITUDE_MODES,
     DEFAULT_AMPLITUDE_V,
+    DEFAULT_AI29_ATTENUATION,
     DEFAULT_CYCLES,
     DEFAULT_FREQUENCY_HZ,
     DEFAULT_POST_ACQ_MS,
@@ -120,9 +123,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
         left = QWidget()
-        left.setFixedWidth(390)
+        left.setMinimumWidth(410)
         layout = QVBoxLayout(left)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         project_group = QGroupBox("项目")
         project_row = QHBoxLayout(project_group)
@@ -133,16 +137,38 @@ class MainWindow(QMainWindow):
         layout.addWidget(project_group)
 
         state_row = QHBoxLayout()
+        state_row.setContentsMargins(8, 2, 8, 2)
+        state_row.addWidget(QLabel("功放:"))
         self._ready_label = QLabel("未充电")
         self._ready_label.setStyleSheet("color:#ef6c00;font-weight:bold")
-        self._pxi_label = QLabel("PXI: 检测中")
         state_row.addWidget(self._ready_label)
+        state_row.addSpacing(18)
+        self._pxi_label = QLabel("PXI: 检测中")
         state_row.addWidget(self._pxi_label)
         state_row.addStretch()
         layout.addLayout(state_row)
 
         params_group = QGroupBox("FDEM 发射与采集参数")
-        params_form = QFormLayout(params_group)
+        params_grid = QGridLayout(params_group)
+        params_grid.setContentsMargins(16, 16, 16, 14)
+        params_grid.setHorizontalSpacing(12)
+        params_grid.setVerticalSpacing(9)
+        params_grid.setColumnStretch(0, 0)
+        params_grid.setColumnStretch(1, 1)
+        params_grid.setColumnStretch(2, 0)
+
+        def add_parameter_row(row, text, widget, hint=""):
+            label = QLabel(text)
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            label.setMinimumWidth(125)
+            widget.setMinimumWidth(165)
+            params_grid.addWidget(label, row, 0)
+            params_grid.addWidget(widget, row, 1)
+            if hint:
+                hint_label = QLabel(hint)
+                hint_label.setStyleSheet("color:#616161")
+                params_grid.addWidget(hint_label, row, 2)
+
         self._frequency_spin = QDoubleSpinBox()
         self._frequency_spin.setRange(MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ)
         self._frequency_spin.setDecimals(3)
@@ -159,12 +185,9 @@ class MainWindow(QMainWindow):
         self._amplitude_spin.setReadOnly(True)
         self._amplitude_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
         self._amplitude_mode = QComboBox()
-        self._amplitude_mode.addItem("请选择 3.3 V 定义", "")
+        self._amplitude_mode.addItem("请选择 Vpp / Vpk", "")
         for mode in AMPLITUDE_MODES:
             self._amplitude_mode.addItem(mode, mode)
-        amplitude_row = QHBoxLayout()
-        amplitude_row.addWidget(self._amplitude_spin)
-        amplitude_row.addWidget(self._amplitude_mode)
         self._samples_combo = QComboBox()
         for samples in SAMPLES_PER_CYCLE_OPTIONS:
             self._samples_combo.addItem(str(samples), samples)
@@ -179,22 +202,31 @@ class MainWindow(QMainWindow):
         self._post_spin.setSuffix(" ms")
         self._atten_spin = QDoubleSpinBox()
         self._atten_spin.setRange(0.001, 100_000.0)
-        self._atten_spin.setValue(1.0)
+        self._atten_spin.setValue(DEFAULT_AI29_ATTENUATION)
         self._atten_spin.setSuffix(" x")
-        params_form.addRow("频率 f:", self._frequency_spin)
-        params_form.addRow("完整周期 n:", self._cycles_spin)
-        params_form.addRow("标称幅值:", amplitude_row)
-        params_form.addRow("每周期采样点:", self._samples_combo)
-        params_form.addRow("发射前采集:", self._pre_spin)
-        params_form.addRow("发射后采集:", self._post_spin)
-        params_form.addRow("ai29 衰减倍数:", self._atten_spin)
+
+        add_parameter_row(0, "频率 f", self._frequency_spin)
+        add_parameter_row(1, "完整周期 n", self._cycles_spin, "周期")
+        add_parameter_row(2, "标称幅值", self._amplitude_spin, "固定")
+        add_parameter_row(3, "幅值定义", self._amplitude_mode, "必选")
+        add_parameter_row(4, "每周期采样点", self._samples_combo, "点")
+        add_parameter_row(5, "发射前采集", self._pre_spin)
+        add_parameter_row(6, "发射后采集", self._post_spin)
+        add_parameter_row(7, "ai29 衰减倍数", self._atten_spin)
+
         self._derived_label = QLabel()
         self._derived_label.setWordWrap(True)
-        params_form.addRow("计算结果:", self._derived_label)
+        self._derived_label.setMinimumHeight(42)
+        self._derived_label.setContentsMargins(10, 6, 10, 6)
+        self._derived_label.setStyleSheet(
+            "background:#f5f5f5;border:1px solid #d5d5d5;border-radius:5px;color:#424242"
+        )
+        params_grid.addWidget(self._derived_label, 8, 0, 1, 3)
         layout.addWidget(params_group)
 
         safety_group = QGroupBox("IGBT 安全联锁")
         safety_layout = QVBoxLayout(safety_group)
+        safety_layout.setSpacing(7)
         warning = QLabel("警告：IGBT 无保护。ao0 出现直流或正弦 offset 会立即烧坏。")
         warning.setWordWrap(True)
         warning.setStyleSheet("color:#b71c1c;font-weight:bold")
@@ -203,12 +235,16 @@ class MainWindow(QMainWindow):
         self._preflight_label.setWordWrap(True)
         safety_layout.addWidget(self._preflight_label)
         self._scope_confirm = QCheckBox("已断开功放并用 DC 耦合示波器确认 ao0 无直流/offset")
+        self._scope_confirm.setToolTip(
+            "功放断电且 Signal in 断开时，用 DC 耦合示波器检查 ao0 的启动、运行、结束和异常状态。"
+        )
         self._scope_confirm.stateChanged.connect(self._update_fire_enabled)
         safety_layout.addWidget(self._scope_confirm)
         layout.addWidget(safety_group)
 
         point_group = QGroupBox("测点管理")
         point_layout = QFormLayout(point_group)
+        point_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self._point_edit = QLineEdit("测点1")
         self._point_edit.textChanged.connect(self._update_measurement_count)
         self._count_label = QLabel()
@@ -241,7 +277,14 @@ class MainWindow(QMainWindow):
         buttons_layout.addLayout(aux)
         layout.addWidget(buttons)
         layout.addStretch()
-        root.addWidget(left)
+
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setFrameShape(QScrollArea.NoFrame)
+        left_scroll.setFixedWidth(440)
+        left_scroll.setWidget(left)
+        root.addWidget(left_scroll)
 
         self._chart_container = QWidget()
         self._chart_layout = QVBoxLayout(self._chart_container)
@@ -442,7 +485,7 @@ class MainWindow(QMainWindow):
             f" --pre-acq-ms {params['pre_acq_ms']} --post-acq-ms {params['post_acq_ms']}"
         )
 
-        destination = self._next_destination_prefix()
+        destination = self._next_destination_prefix(params["frequency_hz"])
 
         def done(ok, stdout, stderr):
             if not ok:
@@ -531,20 +574,37 @@ class MainWindow(QMainWindow):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _next_destination_prefix(self):
+    @staticmethod
+    def _frequency_tag(frequency_hz):
+        text = f"{float(frequency_hz):.6f}".rstrip("0").rstrip(".")
+        return f"{text.replace('.', 'p')}Hz"
+
+    def _next_destination_prefix(self, frequency_hz):
         point_dir = self._point_dir()
         number = self._next_measurement_number(point_dir)
         point = self._safe_name(self._point_edit.text(), "测点")
-        return point_dir / f"{point}_{number:03d}"
+        return point_dir / f"{point}_{number:03d}_{self._frequency_tag(frequency_hz)}"
 
     @staticmethod
     def _next_measurement_number(point_dir):
         numbers = []
         for path in point_dir.glob("*_rx.npy"):
-            match = re.search(r"_(\d+)_rx\.npy$", path.name)
+            match = re.search(r"_(\d+)(?:_[^_]+Hz)?_rx\.npy$", path.name)
             if match:
                 numbers.append(int(match.group(1)))
         return max(numbers, default=0) + 1
+
+    @staticmethod
+    def _measurement_prefix(point_dir, point, number):
+        old_prefix = point_dir / f"{point}_{number:03d}"
+        if Path(f"{old_prefix}_rx.npy").exists():
+            return old_prefix
+        matches = sorted(point_dir.glob(f"{point}_{number:03d}_*Hz_rx.npy"))
+        if not matches:
+            raise FileNotFoundError(f"找不到测量数据: {point} 第 {number} 次")
+        if len(matches) > 1:
+            raise RuntimeError(f"测量编号 {number} 对应多个频率文件")
+        return Path(str(matches[0])[:-len("_rx.npy")])
 
     def _update_measurement_count(self, *_):
         number = self._next_measurement_number(self._point_dir())
@@ -576,8 +636,10 @@ class MainWindow(QMainWindow):
         if not point:
             return
         project = DATA_DIR / self._safe_name(self._project_edit.text(), "default") / point
-        prefix = project / f"{point}_{self._history_number.value():03d}"
         try:
+            prefix = self._measurement_prefix(
+                project, point, self._history_number.value()
+            )
             self._load_prefix(prefix)
             self._status.showMessage(f"已加载: {prefix}")
         except Exception as exc:
@@ -589,7 +651,8 @@ class MainWindow(QMainWindow):
         self._data_i = np.load(f"{prefix}_current.npy")
         with open(f"{prefix}_info.json", encoding="utf-8") as handle:
             self._last_params = json.load(handle)
-        self._atten_spin.setValue(float(self._last_params.get("atten", 1.0)))
+        self._last_params.setdefault("atten", DEFAULT_AI29_ATTENUATION)
+        self._atten_spin.setValue(float(self._last_params["atten"]))
         self._draw_all()
 
     def _draw_all(self, *_):
