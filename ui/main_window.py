@@ -42,6 +42,7 @@ from config import (
     DEFAULT_AI29_ATTENUATION,
     DEFAULT_CYCLES,
     DEFAULT_FREQUENCY_HZ,
+    DEFAULT_FREQUENCY_STEP_HZ,
     DEFAULT_POST_ACQ_MS,
     DEFAULT_PRE_ACQ_MS,
     DEFAULT_SAMPLES_PER_CYCLE,
@@ -57,6 +58,7 @@ from config import (
 from fdem_acquisition import build_fdem_waveform
 from logger import log, log_exception, log_ssh
 from ui.frequency_window import FrequencyWindow
+from ui.monitor_window import MonitorWindow
 from ui.widgets import MplCanvas
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
         self._pxi_online = False
         self._charged = False
         self._frequency_window = None
+        self._monitor_window = None
         self._operation_busy = False
         self._operation_signals = None
 
@@ -174,6 +177,15 @@ class MainWindow(QMainWindow):
         self._frequency_spin.setDecimals(3)
         self._frequency_spin.setValue(DEFAULT_FREQUENCY_HZ)
         self._frequency_spin.setSuffix(" Hz")
+        self._frequency_step_spin = QDoubleSpinBox()
+        self._frequency_step_spin.setRange(0.001, MAX_FREQUENCY_HZ)
+        self._frequency_step_spin.setDecimals(3)
+        self._frequency_step_spin.setValue(DEFAULT_FREQUENCY_STEP_HZ)
+        self._frequency_step_spin.setSuffix(" Hz")
+        self._frequency_step_button = QPushButton("f + df")
+        self._frequency_step_button.setFixedWidth(72)
+        self._frequency_step_button.setToolTip("将当前发射频率增加 df")
+        self._frequency_step_button.clicked.connect(self._increase_frequency)
         self._cycles_spin = QSpinBox()
         self._cycles_spin.setRange(1, 10_000)
         self._cycles_spin.setValue(DEFAULT_CYCLES)
@@ -206,13 +218,15 @@ class MainWindow(QMainWindow):
         self._atten_spin.setSuffix(" x")
 
         add_parameter_row(0, "频率 f", self._frequency_spin)
-        add_parameter_row(1, "完整周期 n", self._cycles_spin, "周期")
-        add_parameter_row(2, "标称幅值", self._amplitude_spin, "固定")
-        add_parameter_row(3, "幅值定义", self._amplitude_mode, "必选")
-        add_parameter_row(4, "每周期采样点", self._samples_combo, "点")
-        add_parameter_row(5, "发射前采集", self._pre_spin)
-        add_parameter_row(6, "发射后采集", self._post_spin)
-        add_parameter_row(7, "ai29 衰减倍数", self._atten_spin)
+        add_parameter_row(1, "频率步进 df", self._frequency_step_spin)
+        params_grid.addWidget(self._frequency_step_button, 1, 2)
+        add_parameter_row(2, "完整周期 n", self._cycles_spin, "周期")
+        add_parameter_row(3, "标称幅值", self._amplitude_spin, "固定")
+        add_parameter_row(4, "幅值定义", self._amplitude_mode, "必选")
+        add_parameter_row(5, "每周期采样点", self._samples_combo, "点")
+        add_parameter_row(6, "发射前采集", self._pre_spin)
+        add_parameter_row(7, "发射后采集", self._post_spin)
+        add_parameter_row(8, "ai29 衰减倍数", self._atten_spin)
 
         self._derived_label = QLabel()
         self._derived_label.setWordWrap(True)
@@ -221,7 +235,7 @@ class MainWindow(QMainWindow):
         self._derived_label.setStyleSheet(
             "background:#f5f5f5;border:1px solid #d5d5d5;border-radius:5px;color:#424242"
         )
-        params_grid.addWidget(self._derived_label, 8, 0, 1, 3)
+        params_grid.addWidget(self._derived_label, 9, 0, 1, 3)
         layout.addWidget(params_group)
 
         safety_group = QGroupBox("IGBT 安全联锁")
@@ -254,7 +268,7 @@ class MainWindow(QMainWindow):
 
         buttons = QGroupBox("操作")
         buttons_layout = QVBoxLayout(buttons)
-        self._btn_charge = QPushButton("① 充电")
+        self._btn_charge = QPushButton("① 充电 (ao1: 0→4V→0)")
         self._btn_charge.setFixedHeight(38)
         self._btn_charge.clicked.connect(self._on_charge)
         self._btn_charge.setEnabled(False)
@@ -272,9 +286,16 @@ class MainWindow(QMainWindow):
         self._btn_screenshot.clicked.connect(self._on_screenshot)
         self._btn_log = QPushButton("日志")
         self._btn_log.clicked.connect(self._on_log)
+        self._btn_monitor = QPushButton("实时监测")
+        self._btn_monitor.setStyleSheet(
+            "background:#00695c;color:white;font-weight:bold"
+        )
+        self._btn_monitor.clicked.connect(self._on_monitor)
+        self._btn_monitor.setEnabled(False)
         for button in (self._btn_frequency, self._btn_screenshot, self._btn_log):
             aux.addWidget(button)
         buttons_layout.addLayout(aux)
+        buttons_layout.addWidget(self._btn_monitor)
         layout.addWidget(buttons)
         layout.addStretch()
 
@@ -315,6 +336,16 @@ class MainWindow(QMainWindow):
         load_button.clicked.connect(self._load_history)
         loader.addWidget(load_button)
         loader.addStretch()
+        loader.addWidget(QLabel("跳过前:"))
+        self._skip_spin = QDoubleSpinBox()
+        self._skip_spin.setRange(0.0, 100.0)
+        self._skip_spin.setValue(0.5)
+        self._skip_spin.setSuffix(" ms")
+        self._skip_spin.setDecimals(2)
+        self._skip_spin.setFixedWidth(90)
+        self._skip_spin.setToolTip("绘图时跳过开头 N ms（过滤充电瞬态），不影响存储数据和幅相分析")
+        self._skip_spin.valueChanged.connect(self._draw_all)
+        loader.addWidget(self._skip_spin)
         self._chart_layout.addLayout(loader)
 
         self._canvas_rx = MplCanvas()
@@ -344,6 +375,18 @@ class MainWindow(QMainWindow):
     def _parameters_changed(self, *_):
         self._scope_confirm.setChecked(False)
         self._update_preflight()
+
+    def _increase_frequency(self):
+        current = self._frequency_spin.value()
+        step = self._frequency_step_spin.value()
+        updated = min(current + step, self._frequency_spin.maximum())
+        self._frequency_spin.setValue(updated)
+        if updated >= self._frequency_spin.maximum():
+            self._status.showMessage(
+                f"频率已达到上限 {self._frequency_spin.maximum():g} Hz"
+            )
+        else:
+            self._status.showMessage(f"频率已增加 {step:g} Hz，当前 {updated:g} Hz")
 
     def _update_preflight(self):
         try:
@@ -388,6 +431,7 @@ class MainWindow(QMainWindow):
         self._pxi_label.setText("PXI: 已连接" if online else "PXI: 离线（可查看本地数据）")
         self._pxi_label.setStyleSheet(f"color:{'#2e7d32' if online else '#c62828'}")
         self._btn_charge.setEnabled(online)
+        self._btn_monitor.setEnabled(online)
         self._update_fire_enabled()
 
     @staticmethod
@@ -443,22 +487,39 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_charge(self):
-        self._status.showMessage("正在发送与 TEM 一致的 ao1 Start 波形...")
+        self._status.showMessage("正在发送 ao1 启动脉冲（0V→4V保持500ms→0V）...")
 
         def done(ok, stdout, stderr):
             if not ok or "START_PULSE_OK" not in stdout:
                 QMessageBox.critical(self, "充电失败", stderr or stdout)
                 return
             self._charged = True
-            self._ready_label.setText("Start 已发送，请确认功放状态")
+            self._ready_label.setText("Start 脉冲已发送，请确认功放状态")
             self._ready_label.setStyleSheet("color:#2e7d32;font-weight:bold")
-            self._status.showMessage("Start 已发送；确认功放准备完成后方可发射")
+            self._status.showMessage(
+                "Start 脉冲已完成（4V保持500ms）；ao1 应已回到 0V，确认功放准备完成后发射"
+            )
             self._update_fire_enabled()
 
-        command = f'cd /d "{PXI_CODE_PATH}" && {PXI_PYTHON} fdem_acquisition.py start'
+        command = f'cd /d "{PXI_CODE_PATH}" && {PXI_PYTHON} fdem_acquisition.py start-enable'
         self._run_remote(command, done)
 
     def _on_fire(self):
+        # If the real-time monitor is streaming ai31, it holds the FDEM_RxAcq
+        # task open. Transmitting now would produce DaqError -50103.
+        if (
+            self._monitor_window is not None
+            and self._monitor_window.isVisible()
+            and self._monitor_window._process is not None
+        ):
+            answer = QMessageBox.warning(
+                self, "实时监测运行中",
+                "实时监测正在使用 ai31，发射前必须停止监测。\n点击「确定」自动停止监测并继续发射。",
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Ok:
+                return
+            self._monitor_window._on_stop()
         try:
             params = self._parameters()
         except ValueError as exc:
@@ -659,10 +720,16 @@ class MainWindow(QMainWindow):
         if self._data_t is None:
             return
         t_ms = self._data_t * 1000.0
+        skip_ms = self._skip_spin.value()
+        skip_samples = int(skip_ms / 1000.0 * self._last_params.get("sample_rate", 1)) if skip_ms > 0 else 0
+        skip_samples = min(skip_samples, max(0, len(t_ms) - 1))
+        t_plot = t_ms[skip_samples:]
+        rx_plot = self._data_rx[skip_samples:]
+        i_plot = self._data_i[skip_samples:]
         frequency = self._last_params.get("frequency_hz", 0.0)
-        self._canvas_rx.update_line(t_ms, self._data_rx, f"接收线圈 ai31 - {frequency:g} Hz")
+        self._canvas_rx.update_line(t_plot, rx_plot, f"接收线圈 ai31 - {frequency:g} Hz")
         self._canvas_i.update_line(
-            t_ms, self._data_i * self._atten_spin.value(),
+            t_plot, i_plot * self._atten_spin.value(),
             f"发射电流 ai29 - {frequency:g} Hz (衰减 x{self._atten_spin.value():g})",
         )
 
@@ -689,3 +756,14 @@ class MainWindow(QMainWindow):
             subprocess.run(["open", str(path)], check=False)
         else:
             QMessageBox.information(self, "提示", "日志文件不存在")
+
+    def _on_monitor(self):
+        """Open real-time ai31 monitoring window."""
+        if not self._pxi_online:
+            QMessageBox.warning(self, "PXI 离线", "PXI 未连接，无法启动实时监测")
+            return
+        if self._monitor_window is None or not self._monitor_window.isVisible():
+            self._monitor_window = MonitorWindow(self)
+        self._monitor_window.show()
+        self._monitor_window.raise_()
+        self._monitor_window.activateWindow()

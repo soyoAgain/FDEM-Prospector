@@ -14,9 +14,7 @@ from datetime import datetime
 import numpy as np
 
 from config import (
-    AI_SAMPLE_CLOCK_SOURCE,
     AMPLITUDE_MODES,
-    AO_SAMPLE_CLOCK_OUTPUT,
     CH_AI_CURRENT,
     CH_RX,
     CH_SIGNAL_IN,
@@ -24,7 +22,7 @@ from config import (
     DEV_RX,
     DEV_TX,
     MAX_AO_ABS_V,
-    MAX_AO_RATE,
+    MAX_SAMPLE_RATE,
     MAX_ACQUISITION_DURATION_S,
     MAX_CYCLES,
     MAX_FREQUENCY_HZ,
@@ -74,8 +72,10 @@ def build_fdem_waveform(
     if peak_v > MAX_AO_ABS_V:
         raise ValueError(f"Peak amplitude exceeds AO limit ({MAX_AO_ABS_V:g} V)")
     sample_rate = float(frequency_hz) * int(samples_per_cycle)
-    if sample_rate > MAX_AO_RATE:
-        raise ValueError(f"AO rate {sample_rate:g} S/s exceeds {MAX_AO_RATE:g} S/s")
+    if sample_rate > MAX_SAMPLE_RATE:
+        raise ValueError(
+            f"Sample rate {sample_rate:g} S/s exceeds AI/AO limit {MAX_SAMPLE_RATE:g} S/s"
+        )
 
     sine_samples = int(cycles) * int(samples_per_cycle)
     pre_samples = int(round(pre_acq_ms / 1000.0 * sample_rate))
@@ -132,30 +132,48 @@ def validate_fdem_waveform(waveform, params: dict) -> None:
         raise ValueError("Pre/post acquisition region must be exactly zero")
 
 
-def send_start_pulse() -> None:
-    """Send the same ao1 Start waveform used by the TEM amplifier."""
+def set_start_level(enable: bool) -> None:
+    """Send the one-shot Start pulse: 0 V -> 4 V for 500 ms -> 0 V.
+
+    The amplifier starts charging when ao1 is high. The final explicit zero
+    sample is required because a finite AO task otherwise holds its last
+    sample, leaving ao1 at 4 V after the task completes.
+    """
     import nidaqmx
     from nidaqmx.constants import AcquisitionType
 
     task = nidaqmx.Task("FDEM_Start")
     try:
         task.ao_channels.add_ao_voltage_chan(f"{DEV_TX}/{CH_START}", min_val=0.0, max_val=10.0)
-        signal = np.zeros(100)
-        signal[10:] = 4.0
+        if enable:
+            # 1 ms low establishes the idle state, 500 ms high starts charging,
+            # and the final zero sample explicitly returns ao1 to idle.
+            signal = np.concatenate((np.zeros(10), np.full(5000, 4.0), np.zeros(1)))
+        else:
+            signal = np.zeros(1)
         task.timing.cfg_samp_clk_timing(
-            rate=10_000, sample_mode=AcquisitionType.FINITE, samps_per_chan=signal.size
+            rate=10_000,
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=signal.size,
         )
         task.write(signal, auto_start=True)
         task.wait_until_done(timeout=2)
     finally:
         task.close()
-    print("START_PULSE_OK")
+    print("START_PULSE_OK" if enable else "START_DISABLED")
 
 
 def fdem_transmit_and_acquire(waveform: np.ndarray, params: dict):
-    """Use the AO sample clock to synchronize ao0 and the two AI channels."""
+    """Acquire ai31 and ai29 while ao0 plays the validated sine waveform.
+
+    AI and AO use their own internal clocks (software-ordered start, same as
+    TEM). PXI_Trig0 hardware clock routing is NOT used here because chassis
+    route availability has not been verified for this slot pair.  A shared
+    hardware clock or PXI trigger can be added later once routing capability
+    is confirmed with NI MAX on the target chassis.
+    """
     import nidaqmx
-    from nidaqmx.constants import AcquisitionType, Edge
+    from nidaqmx.constants import AcquisitionType
 
     validate_fdem_waveform(waveform, params)
     sample_rate = float(params["sample_rate"])
@@ -176,15 +194,14 @@ def fdem_transmit_and_acquire(waveform: np.ndarray, params: dict):
         ai_task.ai_channels.add_ai_voltage_chan(
             f"{DEV_RX}/{CH_AI_CURRENT}", min_val=-10.0, max_val=10.0
         )
-        ao_task.export_signals.samp_clk_output_term = AO_SAMPLE_CLOCK_OUTPUT
         ai_task.timing.cfg_samp_clk_timing(
             rate=sample_rate,
-            source=AI_SAMPLE_CLOCK_SOURCE,
-            active_edge=Edge.RISING,
             sample_mode=AcquisitionType.FINITE,
             samps_per_chan=total_samples,
         )
         ao_task.write(waveform, auto_start=False)
+        # AI starts first so it is ready before the AO trigger edge (same
+        # software-ordered approach used in TEM).
         ai_task.start()
         ao_task.start()
         ao_task.wait_until_done(timeout=timeout)
@@ -219,9 +236,49 @@ def save_result(t, data_rx, data_i, params: dict) -> str:
     return prefix
 
 
+def monitor_ai31(sample_rate: float = 10_000.0, chunk_samples: int = 500) -> None:
+    """Continuously read ai31 and print base64-encoded chunks to stdout.
+
+    Each line of output is either:
+        MONITOR_READY        - acquisition started
+        D:<base64>           - float64 array of chunk_samples voltages
+        MONITOR_ERROR:<msg>  - fatal error
+    """
+    import base64
+
+    import nidaqmx
+    from nidaqmx.constants import AcquisitionType
+
+    task = nidaqmx.Task("FDEM_Monitor")
+    try:
+        task.ai_channels.add_ai_voltage_chan(
+            f"{DEV_RX}/{CH_RX}", min_val=-10.0, max_val=10.0
+        )
+        task.timing.cfg_samp_clk_timing(
+            rate=sample_rate,
+            sample_mode=AcquisitionType.CONTINUOUS,
+        )
+        task.start()
+        print("MONITOR_READY", flush=True)
+        while True:
+            data = np.array(
+                task.read(number_of_samples_per_channel=chunk_samples, timeout=10.0),
+                dtype=np.float64,
+            )
+            encoded = base64.b64encode(data.tobytes()).decode("ascii")
+            print(f"D:{encoded}", flush=True)
+    except Exception as exc:
+        print(f"MONITOR_ERROR:{exc}", flush=True)
+    finally:
+        task.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("start", "transmit"))
+    parser.add_argument(
+        "command",
+        choices=("start-enable", "start-disable", "transmit", "monitor"),
+    )
     parser.add_argument("--frequency-hz", type=float, default=1000.0)
     parser.add_argument("--cycles", type=int, default=10)
     parser.add_argument("--amplitude-v", type=float, default=3.3)
@@ -229,13 +286,32 @@ def main() -> None:
     parser.add_argument("--samples-per-cycle", type=int, default=250)
     parser.add_argument("--pre-acq-ms", type=float, default=10.0)
     parser.add_argument("--post-acq-ms", type=float, default=10.0)
+    parser.add_argument("--monitor-rate", type=float, default=10_000.0)
+    parser.add_argument("--monitor-chunk", type=int, default=500)
     args = parser.parse_args()
 
-    if args.command == "start":
-        send_start_pulse()
+    if args.command == "start-enable":
+        set_start_level(True)
+        return
+    if args.command == "start-disable":
+        set_start_level(False)
+        return
+    if args.command == "monitor":
+        monitor_ai31(args.monitor_rate, args.monitor_chunk)
         return
     if args.amplitude_v != 3.3:
         parser.error("FDEM nominal amplitude is fixed at 3.3 V")
+
+    # Reset both boards before transmit to release tasks left by a previous
+    # failed run, monitor session, or abrupt process exit. ao1 has already
+    # completed its one-shot pulse and returned to 0 V.
+    import nidaqmx as _nidaqmx
+    for _dev in (DEV_TX, DEV_RX):
+        try:
+            _nidaqmx.system.Device(_dev).reset_device()
+        except Exception as _e:
+            print(f"WARN: reset {_dev} failed: {_e}", flush=True)
+
     waveform, params = build_fdem_waveform(
         args.frequency_hz,
         args.cycles,
@@ -247,6 +323,12 @@ def main() -> None:
     )
     t, data_rx, data_i = fdem_transmit_and_acquire(waveform, params)
     save_result(t, data_rx, data_i, params)
+
+    # Reset ao0 after acquisition while ao1 is already at its idle state.
+    try:
+        _nidaqmx.system.Device(DEV_TX).reset_device()
+    except Exception as _e:
+        print(f"WARN: post-transmit reset {DEV_TX} failed: {_e}", flush=True)
 
 
 if __name__ == "__main__":

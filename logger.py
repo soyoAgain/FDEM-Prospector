@@ -42,5 +42,5 @@ def log_ssh(command: str, ok: bool, stdout: str = "", stderr: str = "") -> None:
     log.log(
         logging.INFO if ok else logging.ERROR,
         "SSH %s -> %s stdout=%s stderr=%s",
-        command[:120], "OK" if ok else "FAIL", stdout[:200], stderr[:200],
+        command[:120], "OK" if ok else "FAIL", stdout[:2000], stderr[:2000],
     )
