@@ -13,3 +13,9 @@ data/
 
 # Local notes
 0.txt
+
+# Local hardware test and PDF conversion artifacts
+284344214EBF03359319EE72D0AD83BC.pdf
+mineru_output/
+AO0_SIGNAL_IN_TRANSMIT_LOGIC.md
+LGM400HF65S4T1A_LOW_VOLTAGE_TEST.md

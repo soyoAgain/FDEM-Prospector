@@ -281,7 +281,7 @@ def main() -> None:
     )
     parser.add_argument("--frequency-hz", type=float, default=1000.0)
     parser.add_argument("--cycles", type=int, default=10)
-    parser.add_argument("--amplitude-v", type=float, default=3.3)
+    parser.add_argument("--amplitude-v", type=float, default=6.0)
     parser.add_argument("--amplitude-mode", choices=AMPLITUDE_MODES)
     parser.add_argument("--samples-per-cycle", type=int, default=250)
     parser.add_argument("--pre-acq-ms", type=float, default=10.0)
@@ -299,8 +299,8 @@ def main() -> None:
     if args.command == "monitor":
         monitor_ai31(args.monitor_rate, args.monitor_chunk)
         return
-    if args.amplitude_v != 3.3:
-        parser.error("FDEM nominal amplitude is fixed at 3.3 V")
+    if args.amplitude_v != 6.0:
+        parser.error("FDEM nominal amplitude is fixed at 6 Vpk (12 Vpp)")
 
     # Reset both boards before transmit to release tasks left by a previous
     # failed run, monitor session, or abrupt process exit. ao1 has already

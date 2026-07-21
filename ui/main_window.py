@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from config import (
     AMPLITUDE_MODES,
+    DEFAULT_AMPLITUDE_MODE,
     DEFAULT_AMPLITUDE_V,
     DEFAULT_AI29_ATTENUATION,
     DEFAULT_CYCLES,
@@ -115,7 +116,7 @@ class MainWindow(QMainWindow):
         self._setup_charts()
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage("就绪 - 请先选择 3.3 V 的幅值定义并执行波形预检")
+        self._status.showMessage("就绪 - Signal in 默认幅值为 6 Vpk (12 Vpp)，请执行波形预检")
         self._refresh_history()
         self._update_measurement_count()
         self._update_preflight()
@@ -200,6 +201,9 @@ class MainWindow(QMainWindow):
         self._amplitude_mode.addItem("请选择 Vpp / Vpk", "")
         for mode in AMPLITUDE_MODES:
             self._amplitude_mode.addItem(mode, mode)
+        default_mode_index = self._amplitude_mode.findData(DEFAULT_AMPLITUDE_MODE)
+        if default_mode_index >= 0:
+            self._amplitude_mode.setCurrentIndex(default_mode_index)
         self._samples_combo = QComboBox()
         for samples in SAMPLES_PER_CYCLE_OPTIONS:
             self._samples_combo.addItem(str(samples), samples)
@@ -363,7 +367,7 @@ class MainWindow(QMainWindow):
     def _parameters(self):
         mode = self._amplitude_mode.currentData()
         if not mode:
-            raise ValueError("必须明确选择 3.3 V 是 Vpp 还是 Vpk")
+            raise ValueError("必须明确选择 6 Vpk (12 Vpp) 的幅值定义")
         _, params = build_fdem_waveform(
             self._frequency_spin.value(), self._cycles_spin.value(),
             self._amplitude_spin.value(), mode, self._samples_combo.currentData(),
@@ -527,15 +531,6 @@ class MainWindow(QMainWindow):
             return
         if not self._scope_confirm.isChecked():
             QMessageBox.warning(self, "安全联锁", "必须先完成并确认 DC 耦合示波器检查")
-            return
-        answer = QMessageBox.warning(
-            self, "确认正弦发射",
-            f"即将输出 {params['cycles']} 个 {params['frequency_hz']:g} Hz 正弦周期，"
-            f"幅值 {params['amplitude_v']:g} {params['amplitude_mode']}。\n"
-            "IGBT 无保护，确认 Signal in 无直流和 offset 后继续。",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
             return
         self._status.showMessage("正在进行 FDEM 正弦发射与同步采集...")
         command = (
