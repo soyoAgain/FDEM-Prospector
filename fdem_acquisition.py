@@ -21,6 +21,9 @@ from config import (
     CH_START,
     DEV_RX,
     DEV_TX,
+    EXTERNAL_TRIGGER_MS,
+    EXTERNAL_TRIGGER_SAMPLE_RATE,
+    EXTERNAL_TRIGGER_V,
     MAX_AO_ABS_V,
     MAX_SAMPLE_RATE,
     MAX_ACQUISITION_DURATION_S,
@@ -223,6 +226,62 @@ def fdem_transmit_and_acquire(waveform: np.ndarray, params: dict):
     return t, data[0], data[1]
 
 
+def build_external_trigger() -> np.ndarray:
+    """Build a 4 V, 10 ms pulse followed by an explicit zero sample."""
+    trigger_samples = int(round(EXTERNAL_TRIGGER_MS / 1000.0 * EXTERNAL_TRIGGER_SAMPLE_RATE))
+    return np.concatenate((np.full(trigger_samples, EXTERNAL_TRIGGER_V), np.zeros(1)))
+
+
+def external_trigger_and_acquire(params: dict):
+    """Trigger an external generator on ao0 while acquiring ai31 and ai29."""
+    import nidaqmx
+    from nidaqmx.constants import AcquisitionType
+
+    sample_rate = float(params["sample_rate"])
+    total_samples = int(params["total_samples"])
+    trigger_rate = EXTERNAL_TRIGGER_SAMPLE_RATE
+    trigger = build_external_trigger()
+    timeout = total_samples / sample_rate + 5.0
+    ao_task = nidaqmx.Task("FDEM_ExternalTrigger")
+    ai_task = nidaqmx.Task("FDEM_ExternalRxAcq")
+    try:
+        ao_task.ao_channels.add_ao_voltage_chan(
+            f"{DEV_TX}/{CH_SIGNAL_IN}", min_val=-MAX_AO_ABS_V, max_val=MAX_AO_ABS_V
+        )
+        ao_task.timing.cfg_samp_clk_timing(
+            rate=trigger_rate,
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=trigger.size,
+        )
+        ai_task.ai_channels.add_ai_voltage_chan(f"{DEV_RX}/{CH_RX}", min_val=-10.0, max_val=10.0)
+        ai_task.ai_channels.add_ai_voltage_chan(
+            f"{DEV_RX}/{CH_AI_CURRENT}", min_val=-10.0, max_val=10.0
+        )
+        ai_task.timing.cfg_samp_clk_timing(
+            rate=sample_rate,
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=total_samples,
+        )
+        ao_task.write(trigger, auto_start=False)
+        ai_task.start()
+        ao_task.start()
+        ao_task.wait_until_done(timeout=2.0)
+        ai_task.wait_until_done(timeout=timeout)
+        data = np.asarray(
+            ai_task.read(number_of_samples_per_channel=total_samples, timeout=5),
+            dtype=np.float64,
+        )
+        if data.shape != (2, total_samples):
+            raise RuntimeError(f"Unexpected AI data shape: {data.shape}")
+    finally:
+        try:
+            ao_task.close()
+        finally:
+            ai_task.close()
+    t = np.arange(total_samples, dtype=np.float64) / sample_rate
+    return t, data[0], data[1]
+
+
 def save_result(t, data_rx, data_i, params: dict) -> str:
     os.makedirs(DATA_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
@@ -277,7 +336,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
-        choices=("start-enable", "start-disable", "transmit", "monitor"),
+        choices=("start-enable", "start-disable", "transmit", "external-transmit", "monitor"),
     )
     parser.add_argument("--frequency-hz", type=float, default=1000.0)
     parser.add_argument("--cycles", type=int, default=10)
@@ -298,6 +357,50 @@ def main() -> None:
         return
     if args.command == "monitor":
         monitor_ai31(args.monitor_rate, args.monitor_chunk)
+        return
+    if args.command == "external-transmit":
+        import nidaqmx as _nidaqmx
+
+        if not np.isfinite(args.frequency_hz) or not MIN_FREQUENCY_HZ <= args.frequency_hz <= MAX_FREQUENCY_HZ:
+            parser.error(
+                f"External generator frequency must be in {MIN_FREQUENCY_HZ:g}..{MAX_FREQUENCY_HZ:g} Hz"
+            )
+        if not isinstance(args.cycles, int) or not 1 <= args.cycles <= MAX_CYCLES:
+            parser.error(f"Cycle count must be in 1..{MAX_CYCLES}")
+        sample_rate = args.frequency_hz * args.samples_per_cycle
+        if sample_rate > MAX_SAMPLE_RATE:
+            parser.error(f"Sample rate exceeds AI limit ({MAX_SAMPLE_RATE:g} S/s)")
+        for _dev in (DEV_TX, DEV_RX):
+            try:
+                _nidaqmx.system.Device(_dev).reset_device()
+            except Exception as _e:
+                print(f"WARN: reset {_dev} failed: {_e}", flush=True)
+        total_duration = EXTERNAL_TRIGGER_MS / 1000.0 + args.cycles / args.frequency_hz + args.post_acq_ms / 1000.0
+        total_samples = int(np.ceil(total_duration * sample_rate)) + 1
+        if total_samples > MAX_TOTAL_SAMPLES:
+            parser.error(f"Total samples exceed limit ({MAX_TOTAL_SAMPLES})")
+        if total_duration > MAX_ACQUISITION_DURATION_S:
+            parser.error(f"Acquisition duration exceeds limit ({MAX_ACQUISITION_DURATION_S:g} s)")
+        params = {
+            "frequency_hz": float(args.frequency_hz),
+            "cycles": int(args.cycles),
+            "amplitude_v": None,
+            "amplitude_mode": "external",
+            "peak_amplitude_v": None,
+            "samples_per_cycle": int(args.samples_per_cycle),
+            "sample_rate": float(sample_rate),
+            "pre_acq_ms": 0.0,
+            "post_acq_ms": float(args.post_acq_ms),
+            "trigger_v": EXTERNAL_TRIGGER_V,
+            "trigger_ms": EXTERNAL_TRIGGER_MS,
+            "total_samples": total_samples,
+        }
+        t, data_rx, data_i = external_trigger_and_acquire(params)
+        save_result(t, data_rx, data_i, params)
+        try:
+            _nidaqmx.system.Device(DEV_TX).reset_device()
+        except Exception as _e:
+            print(f"WARN: post-transmit reset {DEV_TX} failed: {_e}", flush=True)
         return
     if args.amplitude_v != 6.0:
         parser.error("FDEM nominal amplitude is fixed at 6 Vpk (12 Vpp)")

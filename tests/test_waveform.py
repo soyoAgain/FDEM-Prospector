@@ -2,10 +2,16 @@ import unittest
 
 import numpy as np
 
-from fdem_acquisition import build_fdem_waveform
+from fdem_acquisition import build_external_trigger, build_fdem_waveform
 
 
 class WaveformTests(unittest.TestCase):
+    def test_external_trigger_is_4v_for_10ms_then_zero(self):
+        trigger = build_external_trigger()
+        self.assertEqual(trigger.size, 101)
+        self.assertTrue(np.all(trigger[:100] == 4.0))
+        self.assertEqual(trigger[-1], 0.0)
+
     def test_vpp_waveform_is_complete_and_zero_mean(self):
         wave, params = build_fdem_waveform(1000.0, 7, 3.3, "Vpp", 100, 2.0, 3.0)
         start = params["pre_samples"]

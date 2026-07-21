@@ -47,6 +47,8 @@ from config import (
     DEFAULT_POST_ACQ_MS,
     DEFAULT_PRE_ACQ_MS,
     DEFAULT_SAMPLES_PER_CYCLE,
+    EXTERNAL_TRIGGER_MS,
+    EXTERNAL_TRIGGER_V,
     MAX_FREQUENCY_HZ,
     MIN_FREQUENCY_HZ,
     PXI_CODE_PATH,
@@ -242,6 +244,34 @@ class MainWindow(QMainWindow):
         params_grid.addWidget(self._derived_label, 9, 0, 1, 3)
         layout.addWidget(params_group)
 
+        external_group = QGroupBox("外接发生器")
+        external_grid = QGridLayout(external_group)
+        external_grid.setContentsMargins(16, 12, 16, 12)
+        external_grid.setHorizontalSpacing(10)
+        external_grid.setVerticalSpacing(8)
+        self._external_frequency_spin = QDoubleSpinBox()
+        self._external_frequency_spin.setRange(MIN_FREQUENCY_HZ, MAX_FREQUENCY_HZ)
+        self._external_frequency_spin.setDecimals(3)
+        self._external_frequency_spin.setValue(DEFAULT_FREQUENCY_HZ)
+        self._external_frequency_spin.setSuffix(" Hz")
+        self._external_cycles_spin = QSpinBox()
+        self._external_cycles_spin.setRange(1, 10_000)
+        self._external_cycles_spin.setValue(DEFAULT_CYCLES)
+        external_grid.addWidget(QLabel("频率 f"), 0, 0)
+        external_grid.addWidget(self._external_frequency_spin, 0, 1)
+        external_grid.addWidget(QLabel("正弦周期 n"), 1, 0)
+        external_grid.addWidget(self._external_cycles_spin, 1, 1)
+        external_grid.addWidget(
+            QLabel(f"ao0 触发：{EXTERNAL_TRIGGER_V:g} V，{EXTERNAL_TRIGGER_MS:g} ms"), 2, 0, 1, 2
+        )
+        self._btn_external = QPushButton("外接发生器触发 + 接收")
+        self._btn_external.setFixedHeight(38)
+        self._btn_external.setToolTip("ao0 输出触发脉冲，随后采集 ai31 和 ai29")
+        self._btn_external.clicked.connect(self._on_external_fire)
+        self._btn_external.setEnabled(False)
+        external_grid.addWidget(self._btn_external, 3, 0, 1, 2)
+        layout.addWidget(external_group)
+
         safety_group = QGroupBox("IGBT 安全联锁")
         safety_layout = QVBoxLayout(safety_group)
         safety_layout.setSpacing(7)
@@ -258,6 +288,14 @@ class MainWindow(QMainWindow):
         )
         self._scope_confirm.stateChanged.connect(self._update_fire_enabled)
         safety_layout.addWidget(self._scope_confirm)
+        self._external_scope_confirm = QCheckBox(
+            "已用 DC 耦合示波器确认外接触发：4 V、10 ms、随后回到 0 V"
+        )
+        self._external_scope_confirm.setToolTip(
+            "功放断电且外接发生器触发输入断开时，确认 ao0 触发脉冲的幅值、持续时间和结束电平。"
+        )
+        self._external_scope_confirm.stateChanged.connect(self._update_fire_enabled)
+        safety_layout.addWidget(self._external_scope_confirm)
         layout.addWidget(safety_group)
 
         point_group = QGroupBox("测点管理")
@@ -324,6 +362,8 @@ class MainWindow(QMainWindow):
                 widget.currentIndexChanged.connect(self._parameters_changed)
             else:
                 widget.valueChanged.connect(self._parameters_changed)
+        self._external_frequency_spin.valueChanged.connect(self._update_fire_enabled)
+        self._external_cycles_spin.valueChanged.connect(self._update_fire_enabled)
         self._atten_spin.valueChanged.connect(self._draw_all)
 
     def _setup_charts(self):
@@ -417,7 +457,17 @@ class MainWindow(QMainWindow):
             self._pxi_online and self._charged and valid and self._scope_confirm.isChecked()
             and not self._operation_busy
         )
+        self._btn_external.setEnabled(
+            self._pxi_online and self._charged and self._external_parameters_valid()
+            and self._external_scope_confirm.isChecked() and not self._operation_busy
+        )
         self._btn_charge.setEnabled(self._pxi_online and not self._operation_busy)
+
+    def _external_parameters_valid(self):
+        return (
+            MIN_FREQUENCY_HZ <= self._external_frequency_spin.value() <= MAX_FREQUENCY_HZ
+            and self._external_cycles_spin.value() >= 1
+        )
 
     def _check_connection(self):
         try:
@@ -558,6 +608,76 @@ class MainWindow(QMainWindow):
                 return
             # Keep hardware controls locked until all four files are validated
             # and atomically promoted to their final names.
+            self._operation_busy = True
+            self._update_fire_enabled()
+            threading.Thread(
+                target=self._pull_files, args=(prefix, params, destination), daemon=True
+            ).start()
+
+        duration_s = params["total_samples"] / params["sample_rate"]
+        self._run_remote(command, done, timeout=max(60.0, duration_s + 60.0))
+
+    def _on_external_fire(self):
+        if (
+            self._monitor_window is not None
+            and self._monitor_window.isVisible()
+            and self._monitor_window._process is not None
+        ):
+            answer = QMessageBox.warning(
+                self, "实时监测运行中",
+                "实时监测正在使用 ai31，发射前必须停止监测。\n点击「确定」自动停止监测并继续采集。",
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Ok:
+                return
+            self._monitor_window._on_stop()
+        if not self._external_parameters_valid():
+            QMessageBox.critical(self, "参数错误", "外接发生器频率或周期数无效")
+            return
+        if not self._external_scope_confirm.isChecked():
+            QMessageBox.warning(self, "安全联锁", "必须先完成并确认外接触发脉冲的 DC 耦合示波器检查")
+            return
+        frequency = self._external_frequency_spin.value()
+        cycles = self._external_cycles_spin.value()
+        sample_rate = frequency * self._samples_combo.currentData()
+        total_duration = EXTERNAL_TRIGGER_MS / 1000.0 + cycles / frequency + self._post_spin.value() / 1000.0
+        params = {
+            "frequency_hz": frequency,
+            "cycles": cycles,
+            "amplitude_v": None,
+            "amplitude_mode": "external",
+            "peak_amplitude_v": None,
+            "samples_per_cycle": self._samples_combo.currentData(),
+            "sample_rate": sample_rate,
+            "pre_acq_ms": 0.0,
+            "post_acq_ms": self._post_spin.value(),
+            "trigger_v": EXTERNAL_TRIGGER_V,
+            "trigger_ms": EXTERNAL_TRIGGER_MS,
+            "total_samples": int(np.ceil(total_duration * sample_rate)) + 1,
+            "atten": self._atten_spin.value(),
+        }
+        self._status.showMessage("正在通过 ao0 触发外接发生器并同步采集...")
+        command = (
+            f'cd /d "{PXI_CODE_PATH}" && {PXI_PYTHON} fdem_acquisition.py external-transmit'
+            f" --frequency-hz {frequency} --cycles {cycles}"
+            f" --samples-per-cycle {params['samples_per_cycle']}"
+            f" --post-acq-ms {params['post_acq_ms']}"
+        )
+        destination = self._next_destination_prefix(frequency)
+
+        def done(ok, stdout, stderr):
+            if not ok:
+                QMessageBox.critical(self, "外接发生器采集失败", stderr or stdout)
+                self._update_fire_enabled()
+                return
+            prefix = next(
+                (line.split(":", 1)[1].strip() for line in stdout.splitlines()
+                 if line.startswith("DATA_SAVED:")), None
+            )
+            if not prefix:
+                QMessageBox.critical(self, "数据错误", "PXI 未返回数据文件路径")
+                self._update_fire_enabled()
+                return
             self._operation_busy = True
             self._update_fire_enabled()
             threading.Thread(

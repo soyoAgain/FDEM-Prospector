@@ -1,4 +1,5 @@
 import matplotlib
+import sys
 
 matplotlib.use("QtAgg")
 
@@ -21,6 +22,12 @@ class MplCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setMinimumHeight(260)
         self._line = None
+
+    def set_cursor(self, cursor):
+        """Avoid a macOS Qt/AppKit cursor crash during Matplotlib hover updates."""
+        if sys.platform == "darwin":
+            return
+        super().set_cursor(cursor)
 
     def init_line(self, color="#1B5E20"):
         (self._line,) = self.ax.plot([], [], lw=0.7, color=color)
