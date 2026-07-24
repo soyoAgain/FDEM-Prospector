@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from config import MIN_CURRENT_MONITOR_AMPLITUDE_VPK
+from config import (
+    DEFAULT_AI29_ATTENUATION,
+    DEFAULT_AI29_SHUNT_RESISTANCE_OHM,
+    MIN_TRANSMIT_CURRENT_APK,
+)
 
 
 def complex_amplitude(signal, sample_rate: float, frequency_hz: float, start: int, count: int) -> complex:
@@ -25,19 +29,29 @@ def analyze_fdem(data_rx, data_i, params: dict) -> dict:
     count = int(params["sine_samples"])
 
     rx = complex_amplitude(data_rx, sample_rate, frequency_hz, start, count)
-    attenuation = float(params.get("atten", 1.0))
+    shunt_resistance = float(
+        params.get("shunt_resistance_ohm", DEFAULT_AI29_SHUNT_RESISTANCE_OHM)
+    )
+    if not np.isfinite(shunt_resistance) or shunt_resistance <= 0:
+        raise ValueError("ai29 shunt resistance must be finite and positive")
+    attenuation = float(params.get("atten", DEFAULT_AI29_ATTENUATION))
     if not np.isfinite(attenuation) or attenuation <= 0:
         raise ValueError("ai29 attenuation must be finite and positive")
-    current = complex_amplitude(data_i, sample_rate, frequency_hz, start, count) * attenuation
+    current = (
+        complex_amplitude(data_i, sample_rate, frequency_hz, start, count)
+        * attenuation
+        / shunt_resistance
+    )
     result = {
         "frequency_hz": frequency_hz,
         "rx_amplitude_vpk": abs(rx),
         "rx_phase_deg": float(np.degrees(np.angle(rx))),
         "current_amplitude_apk": abs(current),
         "current_phase_deg": float(np.degrees(np.angle(current))),
+        "ai29_shunt_resistance_ohm": shunt_resistance,
         "ai29_attenuation": attenuation,
     }
-    if abs(current) >= MIN_CURRENT_MONITOR_AMPLITUDE_VPK:
+    if abs(current) >= MIN_TRANSMIT_CURRENT_APK:
         transfer = rx / current
         result.update({
             "transfer_magnitude": abs(transfer),

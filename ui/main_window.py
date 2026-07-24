@@ -40,6 +40,7 @@ from config import (
     DEFAULT_AMPLITUDE_MODE,
     DEFAULT_AMPLITUDE_V,
     DEFAULT_AI29_ATTENUATION,
+    DEFAULT_AI29_SHUNT_RESISTANCE_OHM,
     DEFAULT_CYCLES,
     DEFAULT_FREQUENCY_HZ,
     DEFAULT_FREQUENCY_STEP_HZ,
@@ -224,6 +225,10 @@ class MainWindow(QMainWindow):
         self._post_spin.setRange(0.0, 10_000.0)
         self._post_spin.setValue(DEFAULT_POST_ACQ_MS)
         self._post_spin.setSuffix(" ms")
+        self._shunt_spin = QDoubleSpinBox()
+        self._shunt_spin.setRange(0.001, 100_000.0)
+        self._shunt_spin.setValue(DEFAULT_AI29_SHUNT_RESISTANCE_OHM)
+        self._shunt_spin.setSuffix(" Ohm")
         self._atten_spin = QDoubleSpinBox()
         self._atten_spin.setRange(0.001, 100_000.0)
         self._atten_spin.setValue(DEFAULT_AI29_ATTENUATION)
@@ -238,7 +243,8 @@ class MainWindow(QMainWindow):
         add_parameter_row(5, "每周期采样点", self._samples_combo, "点")
         add_parameter_row(6, "发射前采集", self._pre_spin)
         add_parameter_row(7, "发射后采集", self._post_spin)
-        add_parameter_row(8, "ai29 衰减倍数", self._atten_spin)
+        add_parameter_row(8, "ai29 采样电阻", self._shunt_spin)
+        add_parameter_row(9, "ai29 探头衰减", self._atten_spin)
 
         self._derived_label = QLabel()
         self._derived_label.setWordWrap(True)
@@ -247,7 +253,7 @@ class MainWindow(QMainWindow):
         self._derived_label.setStyleSheet(
             "background:#f5f5f5;border:1px solid #d5d5d5;border-radius:5px;color:#424242"
         )
-        params_grid.addWidget(self._derived_label, 9, 0, 1, 3)
+        params_grid.addWidget(self._derived_label, 10, 0, 1, 3)
         layout.addWidget(params_group)
 
         external_group = QGroupBox("外接发生器")
@@ -371,6 +377,7 @@ class MainWindow(QMainWindow):
                 widget.valueChanged.connect(self._parameters_changed)
         self._external_frequency_spin.valueChanged.connect(self._update_fire_enabled)
         self._external_cycles_spin.valueChanged.connect(self._update_fire_enabled)
+        self._shunt_spin.valueChanged.connect(self._draw_all)
         self._atten_spin.valueChanged.connect(self._draw_all)
 
     def _setup_charts(self):
@@ -420,6 +427,7 @@ class MainWindow(QMainWindow):
             self._amplitude_spin.value(), mode, self._samples_combo.currentData(),
             self._pre_spin.value(), self._post_spin.value(),
         )
+        params["shunt_resistance_ohm"] = self._shunt_spin.value()
         params["atten"] = self._atten_spin.value()
         return params
 
@@ -711,6 +719,7 @@ class MainWindow(QMainWindow):
             "trigger_v": EXTERNAL_TRIGGER_V,
             "trigger_ms": EXTERNAL_TRIGGER_MS,
             "total_samples": int(np.ceil(total_duration * sample_rate)) + 1,
+            "shunt_resistance_ohm": self._shunt_spin.value(),
             "atten": self._atten_spin.value(),
         }
         self._status.showMessage("正在通过 ao0 触发外接发生器并同步采集...")
@@ -768,6 +777,7 @@ class MainWindow(QMainWindow):
                     saved_params = json.load(handle)
                 if arrays[0].size != int(saved_params["total_samples"]):
                     raise RuntimeError("Downloaded sample count does not match metadata")
+                saved_params["shunt_resistance_ohm"] = params["shunt_resistance_ohm"]
                 saved_params["atten"] = params["atten"]
                 with Path(f"{temp_prefix}_info.json").open("w", encoding="utf-8") as handle:
                     json.dump(saved_params, handle, indent=2, ensure_ascii=False)
@@ -884,7 +894,11 @@ class MainWindow(QMainWindow):
         self._data_i = np.load(f"{prefix}_current.npy")
         with open(f"{prefix}_info.json", encoding="utf-8") as handle:
             self._last_params = json.load(handle)
+        self._last_params.setdefault(
+            "shunt_resistance_ohm", DEFAULT_AI29_SHUNT_RESISTANCE_OHM
+        )
         self._last_params.setdefault("atten", DEFAULT_AI29_ATTENUATION)
+        self._shunt_spin.setValue(float(self._last_params["shunt_resistance_ohm"]))
         self._atten_spin.setValue(float(self._last_params["atten"]))
         self._draw_all()
 
@@ -901,8 +915,9 @@ class MainWindow(QMainWindow):
         frequency = self._last_params.get("frequency_hz", 0.0)
         self._canvas_rx.update_line(t_plot, rx_plot, f"接收线圈 ai31 - {frequency:g} Hz")
         self._canvas_i.update_line(
-            t_plot, i_plot * self._atten_spin.value(),
-            f"发射电流 ai29 - {frequency:g} Hz (衰减 x{self._atten_spin.value():g})",
+            t_plot, i_plot * self._atten_spin.value() / self._shunt_spin.value(),
+            f"发射电流 ai29 - {frequency:g} Hz "
+            f"(探头 x{self._atten_spin.value():g} / {self._shunt_spin.value():g} Ohm)",
         )
 
     def _on_frequency(self):
