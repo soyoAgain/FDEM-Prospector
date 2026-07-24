@@ -2,10 +2,15 @@ import unittest
 
 import numpy as np
 
-from fdem_acquisition import build_external_trigger, build_fdem_waveform
+from fdem_acquisition import build_external_trigger, build_fdem_waveform, is_ready_voltage
 
 
 class WaveformTests(unittest.TestCase):
+    def test_ready_voltage_requires_more_than_4v(self):
+        self.assertFalse(is_ready_voltage(4.0))
+        self.assertTrue(is_ready_voltage(4.000001))
+        self.assertFalse(is_ready_voltage(float("nan")))
+
     def test_external_trigger_is_4v_for_10ms_then_zero(self):
         trigger = build_external_trigger()
         self.assertEqual(trigger.size, 101)

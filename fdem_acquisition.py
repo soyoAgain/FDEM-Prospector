@@ -17,8 +17,13 @@ from config import (
     AMPLITUDE_MODES,
     CH_AI_CURRENT,
     CH_RX,
+    CH_READY,
     CH_SIGNAL_IN,
     CH_START,
+    DEFAULT_CYCLES,
+    DEFAULT_FREQUENCY_HZ,
+    DEFAULT_POST_ACQ_MS,
+    DEFAULT_PRE_ACQ_MS,
     DEV_RX,
     DEV_TX,
     EXTERNAL_TRIGGER_MS,
@@ -31,6 +36,7 @@ from config import (
     MAX_FREQUENCY_HZ,
     MAX_TOTAL_SAMPLES,
     MIN_FREQUENCY_HZ,
+    READY_THRESHOLD_V,
     WAVEFORM_ENDPOINT_ATOL_V,
     WAVEFORM_MEAN_ATOL_V,
 )
@@ -164,6 +170,21 @@ def set_start_level(enable: bool) -> None:
     finally:
         task.close()
     print("START_PULSE_OK" if enable else "START_DISABLED")
+
+
+def read_ready_voltage() -> float:
+    """Read the amplifier Ready voltage from PXI2Slot3/ai10."""
+    import nidaqmx
+
+    with nidaqmx.Task("FDEM_ReadyStatus") as task:
+        task.ai_channels.add_ai_voltage_chan(
+            f"{DEV_TX}/{CH_READY}", min_val=-10.0, max_val=10.0
+        )
+        return float(task.read(timeout=2.0))
+
+
+def is_ready_voltage(voltage: float) -> bool:
+    return np.isfinite(voltage) and voltage > READY_THRESHOLD_V
 
 
 def fdem_transmit_and_acquire(waveform: np.ndarray, params: dict):
@@ -336,15 +357,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
-        choices=("start-enable", "start-disable", "transmit", "external-transmit", "monitor"),
+        choices=("start-enable", "start-disable", "ready", "transmit", "external-transmit", "monitor"),
     )
-    parser.add_argument("--frequency-hz", type=float, default=1000.0)
-    parser.add_argument("--cycles", type=int, default=10)
+    parser.add_argument("--frequency-hz", type=float, default=DEFAULT_FREQUENCY_HZ)
+    parser.add_argument("--cycles", type=int, default=DEFAULT_CYCLES)
     parser.add_argument("--amplitude-v", type=float, default=6.0)
     parser.add_argument("--amplitude-mode", choices=AMPLITUDE_MODES)
     parser.add_argument("--samples-per-cycle", type=int, default=250)
-    parser.add_argument("--pre-acq-ms", type=float, default=10.0)
-    parser.add_argument("--post-acq-ms", type=float, default=10.0)
+    parser.add_argument("--pre-acq-ms", type=float, default=DEFAULT_PRE_ACQ_MS)
+    parser.add_argument("--post-acq-ms", type=float, default=DEFAULT_POST_ACQ_MS)
     parser.add_argument("--monitor-rate", type=float, default=10_000.0)
     parser.add_argument("--monitor-chunk", type=int, default=500)
     args = parser.parse_args()
@@ -354,6 +375,10 @@ def main() -> None:
         return
     if args.command == "start-disable":
         set_start_level(False)
+        return
+    if args.command == "ready":
+        voltage = read_ready_voltage()
+        print(f"READY_VOLTAGE:{voltage:.6f}", flush=True)
         return
     if args.command == "monitor":
         monitor_ai31(args.monitor_rate, args.monitor_chunk)

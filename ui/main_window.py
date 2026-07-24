@@ -14,10 +14,9 @@ from pathlib import Path
 
 import numpy as np
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -56,6 +55,7 @@ from config import (
     PXI_PYTHON,
     PXI_SCP_PATH,
     PXI_USER,
+    READY_THRESHOLD_V,
     SAMPLES_PER_CYCLE_OPTIONS,
 )
 from fdem_acquisition import build_fdem_waveform
@@ -90,6 +90,7 @@ class WorkerSignals(QObject):
     finished = Signal(bool, str, str)
     files_ready = Signal(bool, str, object)
     connection = Signal(bool)
+    ready = Signal(bool, float, str)
 
 
 class MainWindow(QMainWindow):
@@ -103,6 +104,7 @@ class MainWindow(QMainWindow):
         self._signals = WorkerSignals()
         self._signals.connection.connect(self._set_connection_state)
         self._signals.files_ready.connect(self._on_files_ready)
+        self._signals.ready.connect(self._set_ready_state)
         self._data_t = None
         self._data_rx = None
         self._data_i = None
@@ -113,9 +115,13 @@ class MainWindow(QMainWindow):
         self._monitor_window = None
         self._operation_busy = False
         self._operation_signals = None
+        self._ready_poll_in_flight = False
 
         self._setup_controls()
         self._setup_charts()
+        self._ready_timer = QTimer(self)
+        self._ready_timer.setInterval(1000)
+        self._ready_timer.timeout.connect(self._poll_ready)
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage("就绪 - Signal in 默认幅值为 6 Vpk (12 Vpp)，请执行波形预检")
@@ -272,7 +278,7 @@ class MainWindow(QMainWindow):
         external_grid.addWidget(self._btn_external, 3, 0, 1, 2)
         layout.addWidget(external_group)
 
-        safety_group = QGroupBox("IGBT 安全联锁")
+        safety_group = QGroupBox("IGBT 安全提示")
         safety_layout = QVBoxLayout(safety_group)
         safety_layout.setSpacing(7)
         warning = QLabel("警告：IGBT 无保护。ao0 出现直流或正弦 offset 会立即烧坏。")
@@ -282,20 +288,13 @@ class MainWindow(QMainWindow):
         self._preflight_label = QLabel()
         self._preflight_label.setWordWrap(True)
         safety_layout.addWidget(self._preflight_label)
-        self._scope_confirm = QCheckBox("已断开功放并用 DC 耦合示波器确认 ao0 无直流/offset")
-        self._scope_confirm.setToolTip(
-            "功放断电且 Signal in 断开时，用 DC 耦合示波器检查 ao0 的启动、运行、结束和异常状态。"
+        scope_notice = QLabel(
+            "操作前请用 DC 耦合示波器确认：直接发射时 ao0 无直流/offset；"
+            "外接发生器模式为 4 V、10 ms 触发脉冲且随后回到 0 V。"
         )
-        self._scope_confirm.stateChanged.connect(self._update_fire_enabled)
-        safety_layout.addWidget(self._scope_confirm)
-        self._external_scope_confirm = QCheckBox(
-            "已用 DC 耦合示波器确认外接触发：4 V、10 ms、随后回到 0 V"
-        )
-        self._external_scope_confirm.setToolTip(
-            "功放断电且外接发生器触发输入断开时，确认 ao0 触发脉冲的幅值、持续时间和结束电平。"
-        )
-        self._external_scope_confirm.stateChanged.connect(self._update_fire_enabled)
-        safety_layout.addWidget(self._external_scope_confirm)
+        scope_notice.setWordWrap(True)
+        scope_notice.setStyleSheet("color:#616161")
+        safety_layout.addWidget(scope_notice)
         layout.addWidget(safety_group)
 
         point_group = QGroupBox("测点管理")
@@ -314,12 +313,20 @@ class MainWindow(QMainWindow):
         self._btn_charge.setFixedHeight(38)
         self._btn_charge.clicked.connect(self._on_charge)
         self._btn_charge.setEnabled(False)
+        self._ready_lamp = QLabel()
+        self._ready_lamp.setFixedSize(14, 14)
+        self._ready_text = QLabel("Ready 未知")
+        self._set_ready_indicator(None)
         self._btn_fire = QPushButton("② 正弦发射 + 同步采集")
         self._btn_fire.setFixedHeight(42)
         self._btn_fire.setStyleSheet("background:#1565c0;color:white;font-weight:bold")
         self._btn_fire.clicked.connect(self._on_fire)
         self._btn_fire.setEnabled(False)
-        buttons_layout.addWidget(self._btn_charge)
+        charge_row = QHBoxLayout()
+        charge_row.addWidget(self._btn_charge, 1)
+        charge_row.addWidget(self._ready_lamp)
+        charge_row.addWidget(self._ready_text)
+        buttons_layout.addLayout(charge_row)
         buttons_layout.addWidget(self._btn_fire)
         aux = QHBoxLayout()
         self._btn_frequency = QPushButton("幅相")
@@ -417,7 +424,6 @@ class MainWindow(QMainWindow):
         return params
 
     def _parameters_changed(self, *_):
-        self._scope_confirm.setChecked(False)
         self._update_preflight()
 
     def _increase_frequency(self):
@@ -454,12 +460,11 @@ class MainWindow(QMainWindow):
         except ValueError:
             valid = False
         self._btn_fire.setEnabled(
-            self._pxi_online and self._charged and valid and self._scope_confirm.isChecked()
-            and not self._operation_busy
+            self._pxi_online and self._charged and valid and not self._operation_busy
         )
         self._btn_external.setEnabled(
             self._pxi_online and self._charged and self._external_parameters_valid()
-            and self._external_scope_confirm.isChecked() and not self._operation_busy
+            and not self._operation_busy
         )
         self._btn_charge.setEnabled(self._pxi_online and not self._operation_busy)
 
@@ -486,7 +491,62 @@ class MainWindow(QMainWindow):
         self._pxi_label.setStyleSheet(f"color:{'#2e7d32' if online else '#c62828'}")
         self._btn_charge.setEnabled(online)
         self._btn_monitor.setEnabled(online)
+        if not online:
+            self._ready_timer.stop()
+            self._set_ready_indicator(None)
         self._update_fire_enabled()
+
+    def _set_ready_indicator(self, ready, voltage=None):
+        if ready is True:
+            color, text = "#2e7d32", "可放电"
+        elif ready is False:
+            color, text = "#c62828", "不可放电"
+        else:
+            color, text = "#9e9e9e", "Ready 未知"
+        self._ready_lamp.setStyleSheet(
+            f"background:{color};border:1px solid #616161;border-radius:7px"
+        )
+        suffix = f" ({voltage:.2f} V)" if voltage is not None else ""
+        self._ready_text.setText(f"{text}{suffix}")
+        self._ready_text.setStyleSheet(f"color:{color};font-weight:bold")
+
+    def _poll_ready(self):
+        if not self._pxi_online or self._operation_busy or self._ready_poll_in_flight:
+            return
+        self._ready_poll_in_flight = True
+        threading.Thread(target=self._ready_worker, daemon=True).start()
+
+    def _ready_worker(self):
+        try:
+            target = f"{PXI_USER}@{PXI_HOST}"
+            command = (
+                f'set "PYTHONUTF8=1" && set "PYTHONIOENCODING=utf-8" && '
+                f'cd /d "{PXI_CODE_PATH}" && {PXI_PYTHON} fdem_acquisition.py ready'
+            )
+            process = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=3", target, command],
+                capture_output=True, timeout=8,
+            )
+            stdout, stderr = _decode(process.stdout), _decode(process.stderr)
+            if process.returncode != 0:
+                self._signals.ready.emit(False, float("nan"), stderr or stdout)
+                return
+            match = re.search(r"READY_VOLTAGE:([-+0-9.eE]+)", stdout)
+            if not match:
+                self._signals.ready.emit(False, float("nan"), "PXI 未返回 Ready 电压")
+                return
+            self._signals.ready.emit(True, float(match.group(1)), "")
+        except Exception as exc:
+            self._signals.ready.emit(False, float("nan"), str(exc))
+
+    def _set_ready_state(self, ok, voltage, error):
+        self._ready_poll_in_flight = False
+        if not ok or not np.isfinite(voltage):
+            self._set_ready_indicator(None)
+            if error:
+                log.warning("Ready status read failed: %s", error)
+            return
+        self._set_ready_indicator(voltage > READY_THRESHOLD_V, voltage)
 
     @staticmethod
     def _remote_worker(signals, command, timeout):
@@ -553,6 +613,9 @@ class MainWindow(QMainWindow):
             self._status.showMessage(
                 "Start 脉冲已完成（4V保持500ms）；ao1 应已回到 0V，确认功放准备完成后发射"
             )
+            self._set_ready_indicator(None)
+            self._ready_timer.start()
+            self._poll_ready()
             self._update_fire_enabled()
 
         command = f'cd /d "{PXI_CODE_PATH}" && {PXI_PYTHON} fdem_acquisition.py start-enable'
@@ -578,9 +641,6 @@ class MainWindow(QMainWindow):
             params = self._parameters()
         except ValueError as exc:
             QMessageBox.critical(self, "参数错误", str(exc))
-            return
-        if not self._scope_confirm.isChecked():
-            QMessageBox.warning(self, "安全联锁", "必须先完成并确认 DC 耦合示波器检查")
             return
         self._status.showMessage("正在进行 FDEM 正弦发射与同步采集...")
         command = (
@@ -633,9 +693,6 @@ class MainWindow(QMainWindow):
             self._monitor_window._on_stop()
         if not self._external_parameters_valid():
             QMessageBox.critical(self, "参数错误", "外接发生器频率或周期数无效")
-            return
-        if not self._external_scope_confirm.isChecked():
-            QMessageBox.warning(self, "安全联锁", "必须先完成并确认外接触发脉冲的 DC 耦合示波器检查")
             return
         frequency = self._external_frequency_spin.value()
         cycles = self._external_cycles_spin.value()
